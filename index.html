@@ -43,7 +43,7 @@
 </div>
 
 <script>
-// ===== Data source (ETH/USDT, CORS-friendly) =====
+// ===== Data source (ETH/USDT) =====
 const API = "https://min-api.cryptocompare.com/data/v2/histoday?fsym=ETH&tsym=USDT&limit=2000";
 
 // ===== Helpers =====
@@ -99,7 +99,7 @@ function zigzag(candles, revPct){
   return {pivots,segments};
 }
 
-// Class windows (with Strong Major = 91–360d)
+// Class windows
 const CFG={
   primary:     {key:"primary",     name:"Primary",      minDays:365, maxDays:Infinity},
   strongMajor: {key:"strongMajor", name:"Strong Major", minDays:91,  maxDays:360},
@@ -116,7 +116,7 @@ function pickLatestForClass(segments, cls){
   return null;
 }
 
-// Same-class cancellation (details for "Reversed by …")
+// Same-class cancellation (for Primary/Minor)
 function cancelledPrimaryDetail(segPrim, pickIdx){
   if(pickIdx==null||pickIdx<0) return null;
   const picked=segPrim[pickIdx];
@@ -162,103 +162,109 @@ function drawChart(canvas, candles, pivots){
 }
 
 async function run(){
-  const res=await fetch(API,{cache:"no-store"});
-  const js=await res.json();
-  if(js.Response!=="Success") throw new Error("API error");
-  const candles=js.Data.Data;
+  try{
+    const res=await fetch(API,{cache:"no-store"});
+    const js=await res.json();
+    if(js.Response!=="Success") throw new Error("API error");
+    const candles=js.Data.Data;
 
-  // Adaptive thresholds
-  const atrp=atr14Percent(candles);
-  const revMinor  = clamp(2.5*atrp, 0.06, 0.20);
-  const revMajor  = clamp(5.0*atrp, 0.15, 0.40);
-  const revPrimary= clamp(8.0*atrp, 0.20, 0.60);
+    // Adaptive thresholds
+    const atrp=atr14Percent(candles);
+    const revMinor  = clamp(2.5*atrp, 0.06, 0.20);
+    const revMajor  = clamp(5.0*atrp, 0.15, 0.40);
+    const revPrimary= clamp(8.0*atrp, 0.20, 0.60);
 
-  // ZigZag (use Major threshold for both Major & Strong Major)
-  const zzMinor  = zigzag(candles, revMinor);
-  const zzMajors = zigzag(candles, revMajor);
-  const zzPrim   = zigzag(candles, revPrimary);
+    // ZigZag (use Major threshold for Major & Strong Major)
+    const zzMinor  = zigzag(candles, revMinor);
+    const zzMajors = zigzag(candles, revMajor);
+    const zzPrim   = zigzag(candles, revPrimary);
 
-  const segMinor = zzMinor.segments;
-  const segMaj   = zzMajors.segments;
-  const segPrim  = zzPrim.segments;
+    const segMinor = zzMinor.segments;
+    const segMaj   = zzMajors.segments;
+    const segPrim  = zzPrim.segments;
 
-  // --- Anas's rule for Major & Strong Major ---
-  const isMajorSeg  = s => (s.days>=CFG.major.minDays   && s.days<=CFG.major.maxDays);
-  const isStrongSeg = s => (s.days>=CFG.strongMajor.minDays && s.days<=CFG.strongMajor.maxDays);
+    // --- Major & Strong Major rule (promotion; cancel only by later Major DOWN) ---
+    const isMajorSeg  = s => (s.days>=CFG.major.minDays   && s.days<=CFG.major.maxDays);
+    const isStrongSeg = s => (s.days>=CFG.strongMajor.minDays && s.days<=CFG.strongMajor.maxDays);
 
-  const idxStrongUp = findLastIdx(segMaj, s => isStrongSeg(s) && s.dir==="up");
-  const idxMajorUp  = findLastIdx(segMaj, s => isMajorSeg(s)  && s.dir==="up");
+    const idxStrongUp = findLastIdx(segMaj, s => isStrongSeg(s) && s.dir==="up");
+    const idxMajorUp  = findLastIdx(segMaj, s => isMajorSeg(s)  && s.dir==="up");
 
-  const strongUp = (idxStrongUp>=0) ? {idx:idxStrongUp, seg:segMaj[idxStrongUp]} : null;
-  const majorUp  = (idxMajorUp>=0)  ? {idx:idxMajorUp,  seg:segMaj[idxMajorUp]}  : null;
+    const strongUp = (idxStrongUp>=0) ? {idx:idxStrongUp, seg:segMaj[idxStrongUp]} : null;
+    const majorUp  = (idxMajorUp>=0)  ? {idx:idxMajorUp,  seg:segMaj[idxMajorUp]}  : null;
 
-  let effectiveMajorUp=null;
-  if (strongUp && (!majorUp || strongUp.seg.endTS >= majorUp.seg.endTS)) {
-    effectiveMajorUp = {idx:strongUp.idx, seg:strongUp.seg}; // promoted continuation
-  } else if (majorUp) {
-    effectiveMajorUp = majorUp;
+    let effectiveMajorUp=null;
+    if (strongUp && (!majorUp || strongUp.seg.endTS >= majorUp.seg.endTS)) {
+      effectiveMajorUp = {idx:strongUp.idx, seg:strongUp.seg}; // promoted continuation
+    } else if (majorUp) {
+      effectiveMajorUp = majorUp;
+    }
+
+    function findLaterMajorDown(afterIdx){
+      for(let j=afterIdx+1;j<segMaj.length;j++){ const s=segMaj[j]; if(isMajorSeg(s) && s.dir==="down") return {idx:j, seg:s}; }
+      return null;
+    }
+    let majorCancelled=false, majorCancelledBy=null;
+    if(effectiveMajorUp){
+      const laterDown=findLaterMajorDown(effectiveMajorUp.idx);
+      if(laterDown){ majorCancelled=true; majorCancelledBy=laterDown; }
+    }
+    const showStrongPanel=!(majorCancelled && strongUp && (effectiveMajorUp.idx===strongUp.idx));
+
+    // Primary & Minor (same-class cancellation)
+    const pickP = pickLatestForClass(segPrim, CFG.primary);
+    const pickm = pickLatestForClass(segMinor, CFG.minor);
+    const cancPrim  = pickP ? cancelledPrimaryDetail(segPrim, pickP.idx) : null;
+    const cancMinor = pickm ? cancelledMinorDetail(segMinor, pickm.idx) : null;
+
+    // Report
+    const report=document.getElementById("report");
+    function reversedLines(canc){
+      if(!canc) return "";
+      const c=canc.seg, lab=canc.byClass.name;
+      return `
+        <div class="k">Reversed by <b>${lab}</b> (${c.dir.toUpperCase()}):</div>
+        <div><span class="k">From:</span> ${fmtDate(c.startTS)} @ ${c.start.toLocaleString()}</div>
+        <div><span class="k">To:</span> ${fmtDate(c.endTS)} @ ${c.end.toLocaleString()}</div>
+        <div><span class="k">Change:</span> ${(c.change*100).toFixed(2)}% · <span class="k">Days:</span> ${c.days}</div>
+      `;
+    }
+    function block(label, pick, cancelInfo){
+      if(!pick) return `<div class="small"><span class="k">${label} trend</span><div>No segment matches the duration.</div></div>`;
+      const s=pick.seg, dirCls=s.dir==="up"?"up":"down";
+      const badge = s.dir==="up" ? `<span class="badge bd-up">UP</span>` : `<span class="badge bd-down">DOWN</span>`;
+      return `
+        <div>
+          <div class="${dirCls} v" style="font-size:16px;margin-bottom:4px">${label} trend ${badge}</div>
+          <div><span class="k">From:</span> ${fmtDate(s.startTS)} @ ${s.start.toLocaleString()}</div>
+          <div><span class="k">To:</span> ${fmtDate(s.endTS)} @ ${s.end.toLocaleString()}</div>
+          <div><span class="k">Change:</span> ${(s.change*100).toFixed(2)}% · <span class="k">Days:</span> ${s.days}</div>
+          ${reversedLines(cancelInfo)}
+        </div>
+      `;
+    }
+
+    const pickSM = strongUp;
+    const pickM  = effectiveMajorUp;
+    const cancelInfoM = majorCancelledBy ? { byClass:{name:"Major"}, seg: majorCancelledBy.seg } : null;
+
+    report.innerHTML =
+        block(CFG.primary.name,     pickP,  cancPrim)
+      + (showStrongPanel && pickSM ? block(CFG.strongMajor.name, pickSM, null) : "")
+      + block(CFG.major.name,       pickM,  cancelInfoM)
+      + block(CFG.minor.name,       pickm,  cancMinor);
+
+    // Chart
+    const cv=document.getElementById("chart");
+    drawChart(cv, candles, zzMinor.pivots);
+  }catch(err){
+    console.error(err);
+    document.getElementById("report").innerHTML = `<div class="small">Error: ${err.message || err}</div>`;
   }
-
-  function findLaterMajorDown(afterIdx){
-    for(let j=afterIdx+1;j<segMaj.length;j++){ const s=segMaj[j]; if(isMajorSeg(s) && s.dir==="down") return {idx:j, seg:s}; }
-    return null;
-  }
-  let majorCancelled=false, majorCancelledBy=null;
-  if(effectiveMajorUp){
-    const laterDown=findLaterMajorDown(effectiveMajorUp.idx);
-    if(laterDown){ majorCancelled=true; majorCancelledBy=laterDown; }
-  }
-  const showStrongPanel=!(majorCancelled && strongUp && (effectiveMajorUp.idx===strongUp.idx));
-
-  // Primary & Minor (same-class cancellation details)
-  const pickP = pickLatestForClass(segPrim, CFG.primary);
-  const pickm = pickLatestForClass(segMinor, CFG.minor);
-  const cancPrim  = pickP ? cancelledPrimaryDetail(segPrim, pickP.idx) : null;
-  const cancMinor = pickm ? cancelledMinorDetail(segMinor, pickm.idx) : null;
-
-  // Build report
-  const report=document.getElementById("report");
-  function reversedLines(canc){
-    if(!canc) return "";
-    const c=canc.seg, lab=canc.byClass.name;
-    return `
-      <div class="k">Reversed by <b>${lab}</b> (${c.dir.toUpperCase()}):</div>
-      <div><span class="k">From:</span> ${fmtDate(c.startTS)} @ ${c.start.toLocaleString()}</div>
-      <div><span class="k">To:</span> ${fmtDate(c.endTS)} @ ${c.end.toLocaleString()}</div>
-      <div><span class="k">Change:</span> ${(c.change*100).toFixed(2)}% · <span class="k">Days:</span> ${c.days}</div>
-    `;
-  }
-  function block(label, pick, cancelInfo){
-    if(!pick) return `<div class="small"><span class="k">${label} trend</span><div>No segment matches the duration.</div></div>`;
-    const s=pick.seg, dirCls=s.dir==="up"?"up":"down";
-    const badge = s.dir==="up" ? `<span class="badge bd-up">UP</span>` : `<span class="badge bd-down">DOWN</span>`;
-    return `
-      <div>
-        <div class="${dirCls} v" style="font-size:16px;margin-bottom:4px">${label} trend ${badge}</div>
-        <div><span class="k">From:</span> ${fmtDate(s.startTS)} @ ${s.start.toLocaleString()}</div>
-        <div><span class="k">To:</span> ${fmtDate(s.endTS)} @ ${s.end.toLocaleString()}</div>
-        <div><span class="k">Change:</span> ${(s.change*100).toFixed(2)}% · <span class="k">Days:</span> ${s.days}</div>
-        ${reversedLines(cancelInfo)}
-      </div>
-    `;
-  }
-
-  const pickSM = strongUp;
-  const pickM  = effectiveMajorUp;
-  const cancelInfoM = majorCancelledBy ? { byClass:{name:"Major"}, seg: majorCancelledBy.seg } : null;
-
-  report.innerHTML =
-      block(CFG.primary.name,     pickP,  cancPrim)
-    + (showStrongPanel && pickSM ? block(CFG.strongMajor.name, pickSM, null) : "")
-    + block(CFG.major.name,       pickM,  cancelInfoM)
-    + block(CFG.minor.name,       pickm,  cancMinor);
-
-  // Chart
-  const cv=document.getElementById("chart");
-  drawChart(cv, candles, zzMinor.pivots);
 }
 
-run().catch(e=>console.error(e));
+run();
 </script>
 </body>
 </html>
+
